@@ -1028,6 +1028,52 @@ impl DirectoryNamespace {
         Ok(Some(manifest_ns.clone()))
     }
 
+    /// Lazily open the `__manifest` dataset (read-only) into the read cell.
+    ///
+    /// `manifest_ns` is populated at construction only if `__manifest` already
+    /// existed then. A manifest created afterwards -- e.g. by another
+    /// connection's write, since Phalanx caches a connection per db and the
+    /// first op on a fresh db is usually a read -- would otherwise stay
+    /// invisible to this connection's reads forever, so describe/list/exists
+    /// report "not found" for a table that is in fact registered. Re-open on
+    /// demand so reads self-heal once the manifest exists. Idempotent and cheap
+    /// once the cell is populated; unlike `manifest_ns_for_write` it never
+    /// creates the manifest.
+    async fn ensure_read_manifest(&self) -> Result<()> {
+        if !self.manifest_enabled
+            || self.manifest_ns.get().is_some()
+            || self.write_manifest_ns.get().is_some()
+        {
+            return Ok(());
+        }
+        match self
+            .manifest_ns
+            .get_or_try_init(|| async {
+                manifest::ManifestNamespace::open_from_directory(
+                    self.root.clone(),
+                    self.storage_options.clone(),
+                    self.session.clone(),
+                    self.object_store.clone(),
+                    self.base_path.clone(),
+                    self.dir_listing_enabled,
+                    self.inline_optimization_enabled,
+                    self.commit_retries,
+                )
+                .await
+                .map(Arc::new)
+            })
+            .await
+        {
+            Ok(_) => Ok(()),
+            // Manifest still doesn't exist: leave the cell empty so a later read
+            // retries once it does. A genuinely absent table is still reported
+            // not-found by the callers' existing `manifest_ns_for_read() == None`
+            // branch, exactly as before.
+            Err(e) if manifest::ManifestNamespace::is_not_found_load_error(&e) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     fn child_namespace_requires_manifest_error(&self) -> Error {
         if self.manifest_enabled {
             NamespaceError::NamespaceNotFound {
@@ -1694,6 +1740,7 @@ impl DirectoryNamespace {
         &self,
         request: DescribeTableRequest,
     ) -> Result<DescribeTableResponse> {
+        self.ensure_read_manifest().await?;
         let is_root_level = request.id.as_ref().is_some_and(|id| id.len() == 1);
         let is_child_table = request.id.as_ref().is_some_and(|id| id.len() > 1);
         let skip_manifest_for_root = self.dir_listing_enabled
@@ -2951,6 +2998,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: ListNamespacesRequest,
     ) -> Result<ListNamespacesResponse> {
         self.record_op("list_namespaces");
+        self.ensure_read_manifest().await?;
         if let Some(manifest_ns) = self.manifest_ns_for_read() {
             return manifest_ns.list_namespaces(request).await;
         }
@@ -2967,6 +3015,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: DescribeNamespaceRequest,
     ) -> Result<DescribeNamespaceResponse> {
         self.record_op("describe_namespace");
+        self.ensure_read_manifest().await?;
         if let Some(manifest_ns) = self.manifest_ns_for_read() {
             return manifest_ns.describe_namespace(request).await;
         }
@@ -3027,6 +3076,7 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
         self.record_op("namespace_exists");
+        self.ensure_read_manifest().await?;
         if let Some(manifest_ns) = self.manifest_ns_for_read() {
             return manifest_ns.namespace_exists(request).await;
         }
@@ -3040,6 +3090,7 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
         self.record_op("list_tables");
+        self.ensure_read_manifest().await?;
         // Validate that namespace ID is provided
         let namespace_id = request.id.as_ref().ok_or_else(|| {
             lance_core::Error::from(NamespaceError::InvalidInput {
@@ -3129,6 +3180,7 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
         self.record_op("table_exists");
+        self.ensure_read_manifest().await?;
         let is_root_level = request.id.as_ref().is_some_and(|id| id.len() == 1);
         let is_child_table = request.id.as_ref().is_some_and(|id| id.len() > 1);
         let skip_manifest_for_root = self.dir_listing_enabled
@@ -9167,6 +9219,62 @@ mod tests {
         assert!(result.is_ok());
         let response = result.unwrap();
         assert!(response.location.is_some());
+    }
+
+    /// Regression: a connection built before `__manifest` exists must still
+    /// resolve a child-namespaced table that a *different* connection registers
+    /// afterwards. Phalanx caches one DirectoryNamespace per db and the first op
+    /// on a fresh db is usually a read, so without a self-healing read path the
+    /// cached reader pins an empty manifest cell and every describe/exists/list
+    /// on the table reports "not found" forever -- even though `create_table`
+    /// reports it already exists. This is the geneva `__system$geneva_jobs`
+    /// open->create->open livelock.
+    #[tokio::test]
+    async fn test_read_self_heals_after_manifest_created_by_other_connection() {
+        let temp_dir = TempStdDir::default();
+        let root = temp_dir.to_str().unwrap();
+
+        // Reader is built while no `__manifest` exists yet -> its read cell is
+        // empty and, before the fix, stays empty forever.
+        let reader = DirectoryNamespaceBuilder::new(root).build().await.unwrap();
+
+        // A *separate* connection creates the child namespace + table, which
+        // lazily creates `__manifest` and registers the entry.
+        let writer = DirectoryNamespaceBuilder::new(root).build().await.unwrap();
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["test_ns".to_string()]);
+        writer.create_namespace(create_ns_req).await.unwrap();
+        let ipc_data = create_test_ipc_data(&create_test_schema());
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(vec!["test_ns".to_string(), "table1".to_string()]);
+        writer
+            .create_table(create_table_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // The reader, though built before the manifest existed, must now resolve
+        // the table on every read path (was TableNotFound before the fix).
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_ns".to_string(), "table1".to_string()]);
+        let resp = reader
+            .describe_table(describe_req)
+            .await
+            .expect("describe_table must resolve a table registered after build");
+        assert!(resp.location.is_some());
+
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["test_ns".to_string(), "table1".to_string()]);
+        reader
+            .table_exists(exists_req)
+            .await
+            .expect("table_exists must resolve a table registered after build");
+
+        let list_req = ListTablesRequest {
+            id: Some(vec!["test_ns".to_string()]),
+            ..Default::default()
+        };
+        let tables = reader.list_tables(list_req).await.unwrap().tables;
+        assert_eq!(tables, vec!["table1".to_string()]);
     }
 
     #[tokio::test]
